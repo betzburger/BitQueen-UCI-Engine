@@ -42,6 +42,10 @@ class BitQueenUCIEngine {
     private val moveGenerator = ChessBitboardMoveGenerator
     private val bookManager = ChessOpeningBookManager()
     
+    // Texel tuning cache: preparsed states + labeled results.
+    private var texelStates: Array<ChessBitboardGameState>? = null
+    private var texelResults: DoubleArray? = null
+
     private var currentPosition = ChessBitboardGameState()
     private var positionHistory = mutableListOf<ULong>()
     private var moveHistoryLAN = mutableListOf<String>()
@@ -53,7 +57,7 @@ class BitQueenUCIEngine {
     fun start() {
         // Unbuffered output is preferred for UCI
         
-        println("BitQueen UCI v4.1 by Peter Betz")
+        println("BitQueen UCI v4.2 by Peter Betz")
         
         var running = true
         while (running) {
@@ -71,6 +75,11 @@ class BitQueenUCIEngine {
                 "ucinewgame" -> handleNewGame()
                 "position" -> handlePosition(tokens)
                 "go" -> handleGo(tokens)
+                "eval" -> handleEval()
+                "getparam" -> handleGetParam(tokens)
+                "listparams" -> handleListParams()
+                "loadepd" -> handleLoadEpd(tokens)
+                "mse" -> handleMse(tokens)
                 "stop" -> handleStop()
                 "ponderhit" -> handlePonderHit()
                 "quit" -> {
@@ -85,7 +94,7 @@ class BitQueenUCIEngine {
     }
     
     private fun handleUCI() {
-        println("id name BitQueen 4.1")
+        println("id name BitQueen 4.2")
         println("id author Peter Betz")
         println()
         
@@ -115,6 +124,26 @@ class BitQueenUCIEngine {
 
         // Clear Hash button
         println("option name Clear Hash type button")
+
+        // Expose all scalar EvalParams as tunable spin options (for texel / SPRT).
+        val tunableScalars = listOf(
+            "PAWN_VALUE_MG","KNIGHT_VALUE_MG","BISHOP_VALUE_MG","ROOK_VALUE_MG","QUEEN_VALUE_MG",
+            "PAWN_VALUE_EG","KNIGHT_VALUE_EG","BISHOP_VALUE_EG","ROOK_VALUE_EG","QUEEN_VALUE_EG",
+            "KING_ATTACK_UNITS_KNIGHT","KING_ATTACK_UNITS_BISHOP","KING_ATTACK_UNITS_ROOK","KING_ATTACK_UNITS_QUEEN",
+            "PAWN_ISOLATED","PAWN_DOUBLED","PAWN_CONNECTED_MG","PAWN_CONNECTED_EG",
+            "ROOK_OPEN_FILE_MG","ROOK_OPEN_FILE_EG","ROOK_SEMI_OPEN_MG","ROOK_SEMI_OPEN_EG",
+            "ROOK_ON_7TH_MG","ROOK_ON_7TH_EG","DOUBLED_ROOKS_MG","DOUBLED_ROOKS_EG",
+            "PAWN_SHIELD_MISSING","KING_OPEN_FILE_OWN","KING_OPEN_FILE_ADJ","KING_SEMI_OPEN_OWN","KING_SEMI_OPEN_ADJ",
+            "BISHOP_PAIR_MG","BISHOP_PAIR_EG","BACK_RANK_MINOR","KNIGHT_OUTPOST",
+            "MOB_KNIGHT_MG","MOB_BISHOP_MG","MOB_ROOK_MG","MOB_QUEEN_MG",
+            "MOB_KNIGHT_EG","MOB_BISHOP_EG","MOB_ROOK_EG","MOB_QUEEN_EG",
+            "TROPISM_KNIGHT_MG","TROPISM_KNIGHT_EG","TROPISM_ROOK_MG","TROPISM_ROOK_EG",
+            "TROPISM_QUEEN_MG","TROPISM_QUEEN_EG","TEMPO"
+        )
+        for (p in tunableScalars) {
+            val v = EvalParams.getParam(p) ?: continue
+            println("option name $p type spin default $v min -10000 max 10000")
+        }
 
         println("uciok")
         flushStdout()
@@ -213,8 +242,103 @@ class BitQueenUCIEngine {
                 transpositionTable.clear()
                 println("info string Hash table cleared")
             }
+            else -> {
+                // Try EvalParams tunable (case-sensitive original token form)
+                val originalName = if (valueIndex > nameIndex) {
+                    tokens.subList(nameIndex + 1, valueIndex).joinToString(" ")
+                } else {
+                    tokens.subList(nameIndex + 1, tokens.size).joinToString(" ")
+                }
+                val intVal = optionValue.toIntOrNull()
+                if (intVal != null && EvalParams.setParam(originalName, intVal)) {
+                    println("info string EvalParam $originalName set to $intVal")
+                } else {
+                    println("info string Unknown option: $optionName")
+                }
+            }
         }
-        
+
+        flushStdout()
+    }
+
+    private fun handleGetParam(tokens: List<String>) {
+        if (tokens.size < 2) {
+            println("info string Usage: getparam <NAME>")
+            flushStdout()
+            return
+        }
+        val name = tokens[1]
+        val v = EvalParams.getParam(name)
+        if (v == null) {
+            println("info string Unknown param: $name")
+        } else {
+            println("param $name $v")
+        }
+        flushStdout()
+    }
+
+    private fun handleListParams() {
+        for (n in EvalParams.listParamNames()) {
+            val v = EvalParams.getParam(n) ?: continue
+            println("param $n $v")
+        }
+        flushStdout()
+    }
+
+    private fun handleLoadEpd(tokens: List<String>) {
+        if (tokens.size < 2) { println("info string Usage: loadepd <path>"); flushStdout(); return }
+        val path = tokens.subList(1, tokens.size).joinToString(" ")
+        val lines = readFileLines(path)
+        if (lines == null) { println("info string Cannot open $path"); flushStdout(); return }
+        val states = ArrayList<ChessBitboardGameState>(lines.size)
+        val results = ArrayList<Double>(lines.size)
+        var skipped = 0
+        for (line in lines) {
+            val bar = line.indexOf('|')
+            if (bar < 0) { skipped++; continue }
+            val fen = line.substring(0, bar).trim()
+            val res = line.substring(bar + 1).trim().toDoubleOrNull()
+            if (res == null) { skipped++; continue }
+            try {
+                states.add(FenParser.parse(fen))
+                results.add(res)
+            } catch (e: Exception) { skipped++ }
+        }
+        texelStates = states.toTypedArray()
+        texelResults = DoubleArray(results.size) { results[it] }
+        println("info string loaded ${states.size} positions (skipped $skipped)")
+        println("loaded ${states.size}")
+        flushStdout()
+    }
+
+    private fun handleMse(tokens: List<String>) {
+        val states = texelStates
+        val results = texelResults
+        if (states == null || results == null) {
+            println("info string No dataset loaded"); flushStdout(); return
+        }
+        // Parse optional K (default 1.13). Passed as float string.
+        val k = if (tokens.size >= 2) tokens[1].toDoubleOrNull() ?: 1.13 else 1.13
+        var err = 0.0
+        val n = states.size
+        var i = 0
+        while (i < n) {
+            val ev = ChessEvaluation.evaluate(states[i], 0).toDouble()
+            // sigmoid(ev, k) = 1/(1+exp(-k*ev/400))
+            val s = 1.0 / (1.0 + kotlin.math.exp(-k * ev / 400.0))
+            val d = results[i] - s
+            err += d * d
+            i++
+        }
+        val mse = err / n
+        println("mse $mse")
+        flushStdout()
+    }
+
+    private fun handleEval() {
+        // ChessEvaluation.evaluate returns a White-POV score (positive = white better).
+        val v = ChessEvaluation.evaluate(currentPosition, 0)
+        println("eval $v")
         flushStdout()
     }
     
@@ -346,7 +470,7 @@ class BitQueenUCIEngine {
             else -> {
                 val myTime = if (currentPosition.whiteToMove) wtime else btime
                 val myInc = if (currentPosition.whiteToMove) winc else binc
-                
+
                 if (myTime != null) {
                     calculateTimeLimit(myTime, myInc ?: 0, movestogo)
                 } else {
@@ -426,20 +550,21 @@ class BitQueenUCIEngine {
     }
     
     private fun calculateTimeLimit(myTime: Long, myInc: Long, movesToGo: Int?): Long {
-        // Soft time management with Move Overhead
         val buffer = options.moveOverhead.toLong()
         val availableTime = (myTime - buffer).coerceAtLeast(100L)
-        
-        return when {
+
+        val limit = when {
             movesToGo != null -> {
-                // Fixed moves to go
-                (availableTime / movesToGo.coerceAtLeast(1)) + (myInc * 0.8).toLong()
+                val mtg = movesToGo.coerceAtLeast(1)
+                val base = availableTime / mtg
+                val incShare = (myInc * 0.75).toLong()
+                (base + incShare).coerceAtMost(availableTime / 2)
             }
             else -> {
-                // Proportional time allocation
-                (availableTime / 40) + (myInc * 0.8).toLong()
+                availableTime / 20 + (myInc * 0.75).toLong()
             }
-        }.coerceIn(10L, availableTime)
+        }
+        return limit.coerceIn(10L, availableTime)
     }
     
     private fun handleStop() {

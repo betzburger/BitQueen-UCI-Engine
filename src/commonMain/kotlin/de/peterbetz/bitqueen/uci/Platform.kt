@@ -2,6 +2,7 @@ package de.peterbetz.bitqueen.uci
 
 expect fun getProcessorCount(): Int
 expect fun flushStdout()
+expect fun readFileLines(path: String): List<String>?
 
 expect class CommonAtomicInt(initialValue: Int) {
     var value: Int

@@ -85,6 +85,11 @@ class ChessBitboardSearch(
     private val historyTable = Array(2) { IntArray(4096) } // [stm][64*64]
     // Counter-move table indexed by previous move's from/to
     private val counterMoves = Array(64) { arrayOfNulls<BitboardChessMove>(64) }
+    // Continuation history: [prevPiece 0..11][prevTo 0..63][piece*64+to]
+    private val contHistory = Array(12) { Array(64) { IntArray(12 * 64) } }
+    private val MAX_HISTORY = 16384
+    // Per-thread pawn hash table used by ChessEvaluation
+    val pawnHash: PawnHashTable = PawnHashTable()
 
     // Static eval stack for "improving" heuristic
     private val staticEvalStack = IntArray(128)
@@ -129,6 +134,19 @@ class ChessBitboardSearch(
         historyTable[1].fill(0)
         for(row in killerMoves) row.fill(null)
         for(row in counterMoves) row.fill(null)
+        for (a in contHistory) for (b in a) b.fill(0)
+        pawnHash.clear()
+    }
+
+    fun contHistGet(prevPiece: Int, prevTo: Int, piece: Int, to: Int): Int {
+        return contHistory[prevPiece][prevTo][piece * 64 + to]
+    }
+
+    fun contHistUpdate(prevPiece: Int, prevTo: Int, piece: Int, to: Int, bonus: Int) {
+        val idx = piece * 64 + to
+        val old = contHistory[prevPiece][prevTo][idx]
+        val updated = old + bonus - old * abs(bonus) / MAX_HISTORY
+        contHistory[prevPiece][prevTo][idx] = updated.coerceIn(-MAX_HISTORY, MAX_HISTORY)
     }
 
     fun startSearch(
@@ -155,6 +173,7 @@ class ChessBitboardSearch(
                 historyTable[c][i] /= 2
             }
         }
+        for (a in contHistory) for (b in a) for (i in b.indices) b[i] /= 2
         staticEvalStack.fill(0)
 
         this.searchStack.clear()
@@ -286,15 +305,27 @@ class ChessBitboardSearch(
         var bestScore = -INFINITY
         var legalMoveFound = false
 
+        var legalCount = 0
         for (move in moves) {
             val nextState = state.copy()
             applyMove(nextState, move)
-            
+
             if (isIllegal(nextState)) continue
             legalMoveFound = true
+            legalCount++
 
             searchStack.add(nextState.hash)
-            val score = -negamax(nextState, depth - 1, -beta, -a, 1, move)
+            var score: Int
+            if (legalCount == 1) {
+                // First legal move: full window
+                score = -negamax(nextState, depth - 1, -beta, -a, 1, move)
+            } else {
+                // PVS: null window first, re-search on fail high
+                score = -negamax(nextState, depth - 1, -a - 1, -a, 1, move)
+                if (score > a && score < beta) {
+                    score = -negamax(nextState, depth - 1, -beta, -a, 1, move)
+                }
+            }
             searchStack.removeAt(searchStack.lastIndex)
 
             if (shouldStop) return null
@@ -396,7 +427,7 @@ class ChessBitboardSearch(
         // Skill Level: add evaluation noise for weaker play
         val noise = if (skillEvalNoise > 0) Random.nextInt(-skillEvalNoise, skillEvalNoise + 1) else 0
         val staticEval = if (!inCheck) {
-            val eval = ChessEvaluation.evaluate(state, contempt)
+            val eval = ChessEvaluation.evaluate(state, contempt, null)
             (if (state.whiteToMove) eval else -eval) + noise
         } else 0
 
@@ -439,6 +470,7 @@ class ChessBitboardSearch(
         }
 
         val moves = moveGenerator.generateMoves(state).toMutableList()
+        if (prevMove != null) buildPieceMap(state)
         scoreMoves(moves, ttMovePacked, ply, state, prevMove)
         moves.sortByDescending { it.score }
 
@@ -524,9 +556,19 @@ class ChessBitboardSearch(
                 val depthIdx = if (searchDepth < LMR_MAX_DEPTH) searchDepth else LMR_MAX_DEPTH - 1
                 val moveIdx = if (index < LMR_MAX_MOVES) index else LMR_MAX_MOVES - 1
                 reduction = lmrTable[depthIdx][moveIdx]
+                // History-based reduction adjustment
                 val hIdx = move.from * 64 + move.to
                 val stmIdx = if (state.whiteToMove) 0 else 1
-                if (historyTable[stmIdx][hIdx] < 0) reduction += 1
+                val hist = historyTable[stmIdx][hIdx]
+                val ch = if (prevMove != null) {
+                    val pp = pieceOnSquare[prevMove.to]
+                    val cp = pieceOnSquare[move.from]
+                    if (pp >= 0 && cp >= 0) contHistGet(pp, prevMove.to, cp, move.to) else 0
+                } else 0
+                val combined = hist + ch
+                // Reduce more for bad history, reduce less for good (capped to ±1)
+                if (combined < -4096) reduction += 1
+                else if (combined > 4096) reduction -= 1
                 if (!improving) reduction += 1
                 if (isPvNode && reduction > 1) reduction = 1
                 if (reduction < 1) reduction = 1
@@ -577,7 +619,25 @@ class ChessBitboardSearch(
                 if (isQuiet) {
                     updateKiller(move, ply)
                     updateHistory(move, searchDepth, stmIdx)
-                    // Penalize all other tried quiets
+                    // Update continuation history
+                    if (prevMove != null) {
+                        val pp = pieceOnSquare[prevMove.to]
+                        if (pp >= 0) {
+                            val pt = prevMove.to
+                            val cp = pieceOnSquare[move.from]
+                            if (cp >= 0) {
+                                contHistUpdate(pp, pt, cp, move.to, searchDepth * searchDepth)
+                            }
+                            // Penalize tried quiets in contHistory
+                            for (q in triedQuiets) {
+                                if (!sameMove(q, move)) {
+                                    val qp = pieceOnSquare[q.from]
+                                    if (qp >= 0) contHistUpdate(pp, pt, qp, q.to, -(searchDepth * searchDepth))
+                                }
+                            }
+                        }
+                    }
+                    // Penalize all other tried quiets in butterfly history
                     for (q in triedQuiets) {
                         if (!sameMove(q, move)) penalizeHistory(q, searchDepth, stmIdx)
                     }
@@ -633,7 +693,7 @@ class ChessBitboardSearch(
         var standPat = -INFINITY
 
         if (!inCheck) {
-            val eval = ChessEvaluation.evaluate(state, contempt)
+            val eval = ChessEvaluation.evaluate(state, contempt, null)
             val qNoise = if (skillEvalNoise > 0) Random.nextInt(-skillEvalNoise, skillEvalNoise + 1) else 0
             standPat = (if (state.whiteToMove) eval else -eval) + qNoise
             if (standPat >= beta) return beta
@@ -691,6 +751,13 @@ class ChessBitboardSearch(
         val ttTo = if(ttMovePacked != 0) ttMovePacked and 0x3F else -1
         val stm = if (state.whiteToMove) 0 else 1
         val counter: BitboardChessMove? = if (prevMove != null) counterMoves[prevMove.from][prevMove.to] else null
+        // Continuation history context: prevMove was made by opponent, piece now at prevMove.to
+        val hasCont = prevMove != null
+        val prevPiece = if (hasCont) {
+            val idx = pieceOnSquare[prevMove!!.to]
+            if (idx >= 0) idx else 0
+        } else 0
+        val prevTo = prevMove?.to ?: 0
 
         for(move in moves) {
             var score = 0
@@ -701,7 +768,6 @@ class ChessBitboardSearch(
                              else getPieceType(move.to, !state.whiteToMove, state)
                 val attacker = getPieceType(move.from, state.whiteToMove, state)
                 val mvvLva = (getPieceValue(victim) * 10) - getPieceValue(attacker)
-                // MVV-LVA shortcut: if attacker value <= victim value, capture is surely non-losing
                 val attV = getPieceValue(attacker)
                 val vicV = getPieceValue(victim)
                 if (attV <= vicV) {
@@ -716,10 +782,41 @@ class ChessBitboardSearch(
                 else if(counter != null && sameMove(counter, move)) score = 7500
                 else {
                    val idx = move.from * 64 + move.to
-                   score = historyTable[stm][idx]
+                   val h = historyTable[stm][idx]
+                   val ch = if (hasCont) {
+                       val piece = pieceOnSquare[move.from]
+                       if (piece >= 0) contHistGet(prevPiece, prevTo, piece, move.to) else 0
+                   } else 0
+                   // Combined: butterfly + scaled continuation history, kept in safe range
+                   score = h + ch / 4
                 }
             }
             move.score = score
+        }
+    }
+
+    // Piece index array: maps square -> 0..11 (0-5 white P/N/B/R/Q/K, 6-11 black)
+    // Reusable scratch array to avoid per-move getPieceType calls
+    private val pieceOnSquare = IntArray(64) { -1 }
+
+    private fun buildPieceMap(state: ChessBitboardGameState) {
+        for (sq in 0 until 64) {
+            val mask = 1uL shl sq
+            pieceOnSquare[sq] = when {
+                (state.wP.rawValue and mask) != 0uL -> 0
+                (state.wN.rawValue and mask) != 0uL -> 1
+                (state.wB.rawValue and mask) != 0uL -> 2
+                (state.wR.rawValue and mask) != 0uL -> 3
+                (state.wQ.rawValue and mask) != 0uL -> 4
+                (state.wK.rawValue and mask) != 0uL -> 5
+                (state.bP.rawValue and mask) != 0uL -> 6
+                (state.bN.rawValue and mask) != 0uL -> 7
+                (state.bB.rawValue and mask) != 0uL -> 8
+                (state.bR.rawValue and mask) != 0uL -> 9
+                (state.bQ.rawValue and mask) != 0uL -> 10
+                (state.bK.rawValue and mask) != 0uL -> 11
+                else -> -1
+            }
         }
     }
 
