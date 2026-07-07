@@ -355,8 +355,9 @@
             if ((wP.rawValue and adjacentFiles[file]) == 0uL) {
                 score.mg += isolatedPenalty; score.eg += isolatedPenalty
             }
-            // Doubled
-            if ((wP.rawValue and fileMasks[file]) != (1uL shl sq)) {
+            // Doubled — only penalize if there's a white pawn BEHIND (lower rank)
+            val wPawnsBehind = wP.rawValue and fileMasks[file] and ((1uL shl sq) - 1uL)
+            if (wPawnsBehind != 0uL) {
                 score.mg += doubledPenalty; score.eg += doubledPenalty
             }
             // Connected
@@ -384,8 +385,10 @@
             if ((bP.rawValue and adjacentFiles[file]) == 0uL) {
                 score.mg -= isolatedPenalty; score.eg -= isolatedPenalty
             }
-            // Doubled
-            if ((bP.rawValue and fileMasks[file]) != (1uL shl sq)) {
+            // Doubled — only penalize if there's a black pawn BEHIND (higher rank)
+            val aboveMask = if (sq < 63) (1uL shl (sq + 1)) - 1uL else ULong.MAX_VALUE
+            val bPawnsBehind = bP.rawValue and fileMasks[file] and aboveMask.inv()
+            if (bPawnsBehind != 0uL) {
                 score.mg -= doubledPenalty; score.eg -= doubledPenalty
             }
             // Connected

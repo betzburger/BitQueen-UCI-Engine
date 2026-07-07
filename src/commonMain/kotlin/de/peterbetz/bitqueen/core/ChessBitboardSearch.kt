@@ -253,7 +253,8 @@ class ChessBitboardSearch(
 
         if (bestMove != null) {
             val packed = packMove(bestMove!!)
-            transpositionTable.store(state.hash, bestScore, depth, TTFlag.EXACT.value, packed, 0)
+            val flag = if (bestScore >= beta) TTFlag.LOWER_BOUND.value else if (bestScore > alpha) TTFlag.EXACT.value else TTFlag.UPPER_BOUND.value
+            transpositionTable.store(state.hash, bestScore, depth, flag, packed, 0)
             return Pair(bestMove!!, bestScore)
         }
         return null
@@ -287,14 +288,18 @@ class ChessBitboardSearch(
             ttMovePacked = ttEntry.moveFrom
             hasTTMove = ttEntry.moveFrom != 0
             if (ttEntry.depth >= depth) {
-                if (ttEntry.flag == TranspositionTable.EXACT) return ttEntry.score
+                var ttScore = ttEntry.score
+                if (ttScore > 90000) ttScore -= ply
+                if (ttScore < -90000) ttScore += ply
+                
+                if (ttEntry.flag == TranspositionTable.EXACT) return ttScore
                 if (ttEntry.flag == TranspositionTable.LOWER_BOUND) {
-                    if (ttEntry.score >= b) return ttEntry.score
-                    a = max(a, ttEntry.score)
+                    if (ttScore >= b) return ttScore
+                    a = max(a, ttScore)
                 }
                 if (ttEntry.flag == TranspositionTable.UPPER_BOUND) {
-                    if (ttEntry.score <= a) return ttEntry.score
-                    b = min(b, ttEntry.score)
+                    if (ttScore <= a) return ttScore
+                    b = min(b, ttScore)
                 }
             }
         }
@@ -338,7 +343,7 @@ class ChessBitboardSearch(
             }
         }
 
-        if (skillUseNullMove && useNullMovePruning && !inCheck && searchDepth >= 3) {
+        if (skillUseNullMove && useNullMovePruning && !inCheck && searchDepth >= 3 && hasNonPawnMaterial(state)) {
             val nullState = state.copy()
             applyNullMove(nullState)
             val score = -negamax(nullState, searchDepth - 1 - 2, -b, -b + 1, ply + 1)
@@ -399,7 +404,7 @@ class ChessBitboardSearch(
                     }
                 }
             } else {
-                 score = a 
+                score = a
             }
 
             searchStack.removeAt(searchStack.lastIndex)
@@ -417,7 +422,10 @@ class ChessBitboardSearch(
                     updateKiller(move, ply)
                     updateHistory(move, searchDepth)
                 }
-                transpositionTable.store(state.hash, score, searchDepth, TranspositionTable.LOWER_BOUND, bestMovePacked, 0)
+                var storeScore = score
+                if (storeScore > 90000) storeScore += ply
+                if (storeScore < -90000) storeScore -= ply
+                transpositionTable.store(state.hash, storeScore, searchDepth, TranspositionTable.LOWER_BOUND, bestMovePacked, 0)
                 return score
             }
         }
@@ -428,7 +436,10 @@ class ChessBitboardSearch(
         if (bestScore == -INFINITY) return a
         
         val flag = if (bestScore >= b) TranspositionTable.LOWER_BOUND else if (bestScore > alpha) TranspositionTable.EXACT else TranspositionTable.UPPER_BOUND
-        transpositionTable.store(state.hash, bestScore, searchDepth, flag, bestMovePacked, 0)
+        var storeScore = bestScore
+        if (storeScore > 90000) storeScore += ply
+        if (storeScore < -90000) storeScore -= ply
+        transpositionTable.store(state.hash, storeScore, searchDepth, flag, bestMovePacked, 0)
         return bestScore
     }
 
@@ -507,8 +518,8 @@ class ChessBitboardSearch(
                 val attacker = getPieceType(move.from, state.whiteToMove, state)
                 score = 10000 + (getPieceValue(victim) * 10) - getPieceValue(attacker)
             } else {
-                if(ply < 64 && killerMoves[ply][0] == move) score = 9000
-                else if(ply < 64 && killerMoves[ply][1] == move) score = 8000
+                if(ply < 64 && sameMove(killerMoves[ply][0], move)) score = 9000
+                else if(ply < 64 && sameMove(killerMoves[ply][1], move)) score = 8000
                 else {
                    val idx = move.from * 64 + move.to
                    score = historyTable.getOrElse(idx) { 0 }
@@ -518,9 +529,22 @@ class ChessBitboardSearch(
         }
     }
 
+    private fun hasNonPawnMaterial(state: ChessBitboardGameState): Boolean {
+        return if (state.whiteToMove) {
+            (state.wN.rawValue or state.wB.rawValue or state.wR.rawValue or state.wQ.rawValue) != 0uL
+        } else {
+            (state.bN.rawValue or state.bB.rawValue or state.bR.rawValue or state.bQ.rawValue) != 0uL
+        }
+    }
+
+    private fun sameMove(a: BitboardChessMove?, b: BitboardChessMove?): Boolean {
+        if (a == null || b == null) return false
+        return a.from == b.from && a.to == b.to && a.flag == b.flag
+    }
+
     private fun updateKiller(move: BitboardChessMove, ply: Int) {
         if (ply >= 64) return
-        if (killerMoves[ply][0] == move) return
+        if (sameMove(killerMoves[ply][0], move)) return
         killerMoves[ply][1] = killerMoves[ply][0]
         killerMoves[ply][0] = move
     }
