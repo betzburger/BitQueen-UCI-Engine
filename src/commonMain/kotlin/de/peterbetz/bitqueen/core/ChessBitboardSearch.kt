@@ -77,6 +77,7 @@ class ChessBitboardSearch(
 
     // History for Cycle Detection
     private val searchStack = ArrayList<ULong>(100)
+    private var gameHistoryEnd: Int = 0
 
     // Heuristics
     private val killerMoves = Array(64) { arrayOfNulls<BitboardChessMove>(2) }
@@ -84,6 +85,9 @@ class ChessBitboardSearch(
     private val historyTable = Array(2) { IntArray(4096) } // [stm][64*64]
     // Counter-move table indexed by previous move's from/to
     private val counterMoves = Array(64) { arrayOfNulls<BitboardChessMove>(64) }
+
+    // Static eval stack for "improving" heuristic
+    private val staticEvalStack = IntArray(128)
 
     // LMR reduction table: lmrTable[depth][moveIndex]
     private val LMR_MAX_DEPTH = 64
@@ -145,9 +149,20 @@ class ChessBitboardSearch(
         _nodesVisited.value = 0
         _bestMove.value = null
 
+        // History aging: halve all values to dampen signal from previous searches
+        for (c in 0..1) {
+            for (i in historyTable[c].indices) {
+                historyTable[c][i] /= 2
+            }
+        }
+        staticEvalStack.fill(0)
+
         this.searchStack.clear()
         this.searchStack.addAll(history)
         this.searchStack.add(state.hash)
+        // Everything at index < gameHistoryEnd is from the actual game history (plus the current root position).
+        // Indices >= gameHistoryEnd are positions reached within this search tree.
+        this.gameHistoryEnd = this.searchStack.size
 
         var alpha = -INFINITY
         var beta = INFINITY
@@ -159,10 +174,27 @@ class ChessBitboardSearch(
             transpositionTable.newGeneration()
             onProgress?.invoke(depth)
 
+            // Aspiration window widening (incremental). Delta is reset each ID iteration.
+            // Safer variant: on fail-low only lower alpha (leave beta); on fail-high only raise beta (leave alpha).
+            var delta = 20
             if (previousScore != null && depth >= 4) {
-                val window = 35
-                alpha = max(-INFINITY, previousScore!! - window)
-                beta = min(INFINITY, previousScore!! + window)
+                alpha = max(-INFINITY, previousScore!! - delta)
+                beta = min(INFINITY, previousScore!! + delta)
+            } else if (previousScore == null && depth >= 2) {
+                // TT-based aspiration start: if root TT entry has an EXACT, non-mate score, center on it.
+                val rootEntry = transpositionTable.get(state.hash)
+                if (rootEntry != null &&
+                    rootEntry.flag == TranspositionTable.EXACT &&
+                    abs(rootEntry.score) < 90000) {
+                    val ttCenter = rootEntry.score
+                    val wideDelta = 60
+                    alpha = max(-INFINITY, ttCenter - wideDelta)
+                    beta = min(INFINITY, ttCenter + wideDelta)
+                    delta = wideDelta
+                } else {
+                    alpha = -INFINITY
+                    beta = INFINITY
+                }
             } else {
                 alpha = -INFINITY
                 beta = INFINITY
@@ -176,13 +208,15 @@ class ChessBitboardSearch(
                 val best = bestInIteration ?: break
 
                 if (best.second <= alpha) {
-                    alpha = -INFINITY
-                    beta = INFINITY
+                    alpha = max(-INFINITY, best.second - delta)
+                    delta += delta / 2 + 5
+                    if (delta > 800) { alpha = -INFINITY; beta = INFINITY }
                     continue
                 }
                 if (best.second >= beta) {
-                    beta = INFINITY
-                    alpha = -INFINITY
+                    beta = min(INFINITY, best.second + delta)
+                    delta += delta / 2 + 5
+                    if (delta > 800) { alpha = -INFINITY; beta = INFINITY }
                     continue
                 }
                 break
@@ -292,7 +326,22 @@ class ChessBitboardSearch(
         if (shouldStop) return 0
 
         val currentHash = state.hash
-        if (searchStack.count { it == currentHash } >= 2) return -contempt
+        // Repetition detection:
+        //   2-fold WITHIN search tree (indices >= gameHistoryEnd, excluding the current stack entry) -> draw
+        //   3-fold counting game history -> draw
+        run {
+            var totalCount = 0
+            var searchRepeat = false
+            val last = searchStack.lastIndex
+            for (i in 0 until searchStack.size) {
+                if (searchStack[i] == currentHash) {
+                    totalCount++
+                    if (i != last && i >= gameHistoryEnd) searchRepeat = true
+                }
+            }
+            if (searchRepeat) return -contempt
+            if (totalCount >= 3) return -contempt
+        }
 
         val maxMateScore = MATE_SCORE - ply
         var a = alpha
@@ -329,13 +378,10 @@ class ChessBitboardSearch(
             }
         }
 
-        if (depth >= 4 && !hasTTMove) {
-            negamax(state, depth - 2, a, b, ply, prevMove)
-            val iidEntry = transpositionTable.get(state.hash)
-            if (iidEntry != null && iidEntry.moveFrom != 0) {
-                ttMovePacked = iidEntry.moveFrom
-                hasTTMove = true
-            }
+        // Internal Iterative Reductions: if we have no TT move, reduce depth by 1.
+        var depth = depth
+        if (!hasTTMove && depth >= 4) {
+            depth--
         }
 
         val inCheck = inCheck(state)
@@ -354,9 +400,17 @@ class ChessBitboardSearch(
             (if (state.whiteToMove) eval else -eval) + noise
         } else 0
 
-        // Reverse Futility Pruning: linear 75*depth
+        // Store static eval in stack for improving heuristic; sentinel -INFINITY when in check
+        if (ply < 128) {
+            staticEvalStack[ply] = if (inCheck) -INFINITY else staticEval
+        }
+        val improving = !inCheck && ply >= 2 && staticEvalStack[ply - 2] != -INFINITY &&
+            staticEvalStack[ply] > staticEvalStack[ply - 2]
+
+        // Reverse Futility Pruning: linear 75*depth, reduced when improving
         if (skillUseReverseFutility && !inCheck && searchDepth <= 8 && abs(b) < 90000) {
-            val rfpMargin = 75 * searchDepth
+            var rfpMargin = 75 * searchDepth
+            if (improving) rfpMargin = rfpMargin * 4 / 5
             if (staticEval - rfpMargin >= b) return (staticEval + b) / 2
         }
 
@@ -371,7 +425,7 @@ class ChessBitboardSearch(
 
         // Adaptive Null Move Pruning
         if (skillUseNullMove && useNullMovePruning && !inCheck && searchDepth >= 3 && hasNonPawnMaterial(state) && abs(b) < 90000) {
-            val rAdaptive = (3 + searchDepth / 4 + min((staticEval - b) / 200, 3)).coerceAtLeast(2)
+            val rAdaptive = (3 + searchDepth / 4 + min((staticEval - b) / 200, 3) + (if (improving) 1 else 0)).coerceAtLeast(2)
             val nullState = state.copy()
             applyNullMove(nullState)
             val score = -negamax(nullState, (searchDepth - 1 - rAdaptive).coerceAtLeast(0), -b, -b + 1, ply + 1, null)
@@ -388,6 +442,37 @@ class ChessBitboardSearch(
         scoreMoves(moves, ttMovePacked, ply, state, prevMove)
         moves.sortByDescending { it.score }
 
+        // Singular Extension test (multi-cut-style variant — no exclude-move parameter needed).
+        // If the TT move looks like a singular best move, extend its search depth by +1.
+        // Conditions: depth>=8, TT entry deep enough, lower-bound/exact, non-mate score.
+        // We probe the next few non-TT moves with reduced depth and zero window below singularBeta;
+        // if none of them reach singularBeta, we consider the TT move singular.
+        var singularExtend = false
+        if (depth >= 8 && hasTTMove && ttEntry != null &&
+            ttEntry.depth >= depth - 3 &&
+            (ttEntry.flag == TranspositionTable.LOWER_BOUND || ttEntry.flag == TranspositionTable.EXACT) &&
+            abs(ttEntry.score) < 90000) {
+            val singularBeta = ttEntry.score - depth * 2
+            val reducedDepth = (depth - 1) / 2
+            var probed = 0
+            var anyBeat = false
+            // Iterate moves in their sorted order; skip the TT move; probe up to 4 non-TT legal moves.
+            for (m in moves) {
+                if (packMove(m) == ttMovePacked) continue
+                val ns = state.copy()
+                applyMove(ns, m)
+                if (isIllegal(ns)) continue
+                searchStack.add(ns.hash)
+                val sc = -negamax(ns, reducedDepth, -singularBeta, -singularBeta + 1, ply + 1, m)
+                searchStack.removeAt(searchStack.lastIndex)
+                if (shouldStop) { anyBeat = true; break }
+                if (sc >= singularBeta) { anyBeat = true; break }
+                probed++
+                if (probed >= 4) break
+            }
+            if (!anyBeat && probed > 0) singularExtend = true
+        }
+
         var bestScore = -INFINITY
         var bestMovePacked = 0
         var bestMoveRef: BitboardChessMove? = null
@@ -403,6 +488,18 @@ class ChessBitboardSearch(
 
             val isQuiet = !move.isCapture && !move.isPromotion
             val givesCheck = inCheck(nextState)
+
+            // SEE pruning: skip bad captures / bad quiets at shallow depth.
+            // Never fires on the first legal move (we must have a best move to return).
+            if (legalMovesCount >= 2 && !inCheck && bestScore > -90000 && !move.isPromotion) {
+                if (move.isCapture && searchDepth <= 6) {
+                    val seeThreshold = -searchDepth * 50
+                    if (see(state, move) < seeThreshold) continue
+                } else if (!move.isCapture && !givesCheck && searchDepth <= 3) {
+                    val seeThreshold = -searchDepth * 80
+                    if (see(state, move) < seeThreshold) continue
+                }
+            }
 
             // Late Move Pruning (LMP): at shallow depth, skip quiets after a threshold
             if (!inCheck && isQuiet && !givesCheck && searchDepth <= 4 && bestScore > -90000) {
@@ -430,28 +527,36 @@ class ChessBitboardSearch(
                 val hIdx = move.from * 64 + move.to
                 val stmIdx = if (state.whiteToMove) 0 else 1
                 if (historyTable[stmIdx][hIdx] < 0) reduction += 1
+                if (!improving) reduction += 1
                 if (isPvNode && reduction > 1) reduction = 1
                 if (reduction < 1) reduction = 1
+                if (reduction > searchDepth - 1) reduction = (searchDepth - 1).coerceAtLeast(1)
                 didLMR = true
             }
 
+            // Singular extension: only applies to the TT move. Capped at +1 per move.
+            // Total resulting depth must not exceed 2 * original depth.
+            val isTTMove = (packMove(move) == ttMovePacked)
+            val singExt = if (singularExtend && isTTMove && (searchDepth + 1) <= 2 * depth) 1 else 0
+            val extDepth = searchDepth + singExt
+
             if (didLMR) {
-                val reducedDepth = (searchDepth - 1 - reduction).coerceAtLeast(0)
+                val reducedDepth = (extDepth - 1 - reduction).coerceAtLeast(0)
                 score = -negamax(nextState, reducedDepth, -a - 1, -a, ply + 1, move)
                 if (score > a && reduction > 1) {
                     // Full-depth zero-window re-search before full-window re-search
-                    score = -negamax(nextState, searchDepth - 1, -a - 1, -a, ply + 1, move)
+                    score = -negamax(nextState, extDepth - 1, -a - 1, -a, ply + 1, move)
                 }
                 if (score > a && score < b) {
-                    score = -negamax(nextState, searchDepth - 1, -b, -a, ply + 1, move)
+                    score = -negamax(nextState, extDepth - 1, -b, -a, ply + 1, move)
                 }
             } else {
                 if (legalMovesCount == 1) {
-                    score = -negamax(nextState, searchDepth - 1, -b, -a, ply + 1, move)
+                    score = -negamax(nextState, extDepth - 1, -b, -a, ply + 1, move)
                 } else {
-                    score = -negamax(nextState, searchDepth - 1, -a - 1, -a, ply + 1, move)
+                    score = -negamax(nextState, extDepth - 1, -a - 1, -a, ply + 1, move)
                     if (score > a && score < b) {
-                        score = -negamax(nextState, searchDepth - 1, -b, -a, ply + 1, move)
+                        score = -negamax(nextState, extDepth - 1, -b, -a, ply + 1, move)
                     }
                 }
             }
@@ -493,7 +598,21 @@ class ChessBitboardSearch(
             return if (inCheck) -MATE_SCORE + ply else 0
         }
         if (bestScore == -INFINITY) return a
-        
+
+        // History malus on fail-low: if we had a TT move and no move caused a cutoff
+        // (bestScore <= original alpha), penalize the TT move if it's a quiet.
+        if (bestScore <= alpha && hasTTMove && ttMovePacked != 0) {
+            val ttFrom = (ttMovePacked shr 6) and 0x3F
+            val ttTo = ttMovePacked and 0x3F
+            val stmIdx = if (state.whiteToMove) 0 else 1
+            for (q in triedQuiets) {
+                if (q.from == ttFrom && q.to == ttTo) {
+                    penalizeHistory(q, searchDepth, stmIdx)
+                    break
+                }
+            }
+        }
+
         val flag = if (bestScore >= b) TranspositionTable.LOWER_BOUND else if (bestScore > alpha) TranspositionTable.EXACT else TranspositionTable.UPPER_BOUND
         var storeScore = bestScore
         if (storeScore > 90000) storeScore += ply
@@ -629,7 +748,7 @@ class ChessBitboardSearch(
         if(idx >= 4096) return
         val bonus = depth * depth
         val current = historyTable[stm][idx]
-        historyTable[stm][idx] = current + bonus - (current * bonus / 8192)
+        historyTable[stm][idx] = (current + bonus - (current * bonus / 8192)).coerceIn(-16384, 16384)
     }
 
     private fun penalizeHistory(move: BitboardChessMove, depth: Int, stm: Int) {
@@ -637,7 +756,7 @@ class ChessBitboardSearch(
         if(idx >= 4096) return
         val malus = depth * depth
         val current = historyTable[stm][idx]
-        historyTable[stm][idx] = current - malus - (current * malus / 8192)
+        historyTable[stm][idx] = (current - malus - (current * malus / 8192)).coerceIn(-16384, 16384)
     }
 
     // --- Static Exchange Evaluation ---
