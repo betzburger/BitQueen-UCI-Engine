@@ -90,12 +90,12 @@ cd BitQueenUCI
 
 ### Run
 ```bash
-java -jar build/libs/BitQueen-UCI-2.2.jar
+java -jar build/libs/BitQueen-UCI-4.2.jar
 ```
 
 ### Use with Chess GUI
 1. Install Arena/ChessBase/Cute Chess/etc.
-2. Add UCI engine: BitQueen-UCI-2.2.jar
+2. Add UCI engine: BitQueen-UCI-4.2.jar
 3. Configure hash size and threads
 4. Start playing!
 
@@ -220,7 +220,40 @@ cd BitQueenUCI
 
 ## 🔄 Version History
 
-### v2.2 (2026) - Current
+### v4.2 (2026) - Current
+- Tuning infrastructure (Texel support) & tunable `EvalParams`
+- Custom tuning UCI commands (`getparam`, `listparams`, `loadepd`, `mse`, `eval`)
+- Pawn Hash Table (65,536 entries per thread)
+- Platform specific macOS file reading optimizations
+
+### v4.1 (2026)
+- Singular Extensions (+1 search depth)
+- Improving Heuristic in Search
+- TT-based aspiration window centering
+- Internal Iterative Reductions (IIR)
+- Repetition detection rewrite (separate search/history)
+
+### v4.0 (2026)
+- Butterfly history table indexed by side-to-move
+- Counter-Move Heuristic (`counterMoves` table)
+- Logarithmic LMR table
+- Blocked passed pawn penalty
+- Restricted piece mobility evaluation (ignores pawn-attacked squares)
+
+### v3.1 (2026)
+- Mate score TT caching fix (ply-adjusted)
+- Null move pruning guard (requires non-pawn material)
+- Killer move sameMove check (bugfix)
+- Doubled pawn detection bugfix (checks behind)
+
+### v3.0 (2026)
+- Insufficient material detection (drawn endgames)
+- Rook on 7th rank and doubled rooks evaluation
+- UCI Skill Level option (1-20)
+- Reverse Futility Pruning & Razoring
+- History table gravity-based aging
+
+### v2.2 (2026)
 - Multi-core search (Lazy SMP)
 - Advanced time management
 - King safety evaluation
@@ -244,7 +277,7 @@ cd BitQueenUCI
 ## 📞 Support & Contact
 
 **Author**: Peter Betz  
-**Project**: BitQueen UCI v2.2  
+**Project**: BitQueen UCI v4.2  
 **Year**: 2026  
 **License**: MIT
 
