@@ -32,3 +32,13 @@ bin/
 *.swp
 *.swo
 sources.txt
+
+# UCI Engine build outputs and documentations
+*.exe
+*.kexe
+*.zip
+*.pdf
+*.png
+*.bmp
+*.pages
+BitQueen-UCI-[0-9]*
