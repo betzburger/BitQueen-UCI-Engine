@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "de.peterbetz.bitqueen"
-version = "2.2"
+version = "3.0"
 
 repositories {
     mavenCentral()
@@ -19,15 +19,7 @@ kotlin {
             }
         }
     }
-    linuxX64 {
-        binaries {
-            executable {
-                baseName = "BitQueen-UCI"
-                entryPoint = "de.peterbetz.bitqueen.uci.main"
-            }
-        }
-    }
-
+    
     sourceSets {
         val commonMain by getting {
             dependencies {

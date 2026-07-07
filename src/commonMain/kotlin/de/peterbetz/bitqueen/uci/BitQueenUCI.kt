@@ -4,7 +4,7 @@ import de.peterbetz.bitqueen.core.*
 import kotlinx.coroutines.*
 
 /**
- * BitQueen UCI Engine v2.2
+ * BitQueen UCI Engine v3.0
  * Full UCI (Universal Chess Interface) compatible chess engine
  * 
  * Features:
@@ -20,17 +20,19 @@ import kotlinx.coroutines.*
  * - Time Management
  * 
  * @author Peter Betz
- * @version 2.2
+ * @version 3.0
  */
 
 // UCI Options
 data class UCIOptions(
-    var hashSizeMB: Int = 128,
-    var threads: Int = (getProcessorCount() - 1).coerceAtLeast(1),
+    var hashSizeMB: Int = 512,
+    var threads: Int = 4,
     var contempt: Int = 0,
     var ponder: Boolean = false,
-    var ownBook: Boolean = true,
-    var multiPV: Int = 1
+    var ownBook: Boolean = false,
+    var multiPV: Int = 1,
+    var skillLevel: Int = 20,
+    var moveOverhead: Int = 50
 )
 
 class BitQueenUCIEngine {
@@ -51,7 +53,7 @@ class BitQueenUCIEngine {
     fun start() {
         // Unbuffered output is preferred for UCI
         
-        println("BitQueen UCI v2.2 by Peter Betz")
+        println("BitQueen UCI v3.0 by Peter Betz")
         
         var running = true
         while (running) {
@@ -83,7 +85,7 @@ class BitQueenUCIEngine {
     }
     
     private fun handleUCI() {
-        println("id name BitQueen 2.2")
+        println("id name BitQueen 3.0")
         println("id author Peter Betz")
         println()
         
@@ -105,9 +107,15 @@ class BitQueenUCIEngine {
         // MultiPV
         println("option name MultiPV type spin default ${options.multiPV} min 1 max 5")
         
+        // Skill Level
+        println("option name Skill Level type spin default ${options.skillLevel} min 1 max 20")
+
+        // Move Overhead (time buffer for communication lag)
+        println("option name Move Overhead type spin default ${options.moveOverhead} min 0 max 1000")
+
         // Clear Hash button
         println("option name Clear Hash type button")
-        
+
         println("uciok")
         flushStdout()
     }
@@ -184,6 +192,21 @@ class BitQueenUCIEngine {
                 if (newMultiPV != null && newMultiPV in 1..5) {
                     options.multiPV = newMultiPV
                     println("info string MultiPV set to $newMultiPV")
+                }
+            }
+            "skill level" -> {
+                val newSkill = optionValue.toIntOrNull()
+                if (newSkill != null && newSkill in 1..20) {
+                    options.skillLevel = newSkill
+                    search.skillLevel = newSkill
+                    println("info string Skill Level set to $newSkill")
+                }
+            }
+            "move overhead" -> {
+                val newOverhead = optionValue.toIntOrNull()
+                if (newOverhead != null && newOverhead in 0..1000) {
+                    options.moveOverhead = newOverhead
+                    println("info string Move Overhead set to $newOverhead ms")
                 }
             }
             "clear hash" -> {
@@ -403,8 +426,8 @@ class BitQueenUCIEngine {
     }
     
     private fun calculateTimeLimit(myTime: Long, myInc: Long, movesToGo: Int?): Long {
-        // Soft time management
-        val buffer = 50L // Safety buffer
+        // Soft time management with Move Overhead
+        val buffer = options.moveOverhead.toLong()
         val availableTime = (myTime - buffer).coerceAtLeast(100L)
         
         return when {

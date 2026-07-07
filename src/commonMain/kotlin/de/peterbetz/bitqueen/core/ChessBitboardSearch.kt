@@ -6,6 +6,7 @@ import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.random.Random
 import kotlin.time.TimeSource
 
 class ChessBitboardSearch(
@@ -17,7 +18,39 @@ class ChessBitboardSearch(
 
     // Engine Options
     var useNullMovePruning: Boolean = true
-    var contempt: Int = 0 
+    var contempt: Int = 0
+
+    // Skill Level (1-20, 20 = full strength)
+    var skillLevel: Int = 20
+    // Derived from skillLevel:
+    private val skillMaxDepth: Int get() = when {
+        skillLevel <= 2  -> 2
+        skillLevel <= 4  -> 3
+        skillLevel <= 6  -> 4
+        skillLevel <= 8  -> 5
+        skillLevel <= 10 -> 6
+        skillLevel <= 12 -> 8
+        skillLevel <= 14 -> 10
+        skillLevel <= 16 -> 12
+        skillLevel <= 18 -> 15
+        else -> 100 // unlimited
+    }
+    private val skillEvalNoise: Int get() = when {
+        skillLevel <= 2  -> 150
+        skillLevel <= 4  -> 120
+        skillLevel <= 6  -> 90
+        skillLevel <= 8  -> 65
+        skillLevel <= 10 -> 45
+        skillLevel <= 12 -> 30
+        skillLevel <= 14 -> 18
+        skillLevel <= 16 -> 10
+        skillLevel <= 18 -> 4
+        else -> 0
+    }
+    private val skillUseNullMove: Boolean get() = skillLevel >= 9
+    private val skillUseLMR: Boolean get() = skillLevel >= 11
+    private val skillUseReverseFutility: Boolean get() = skillLevel >= 13
+    private val skillUseRazoring: Boolean get() = skillLevel >= 13
 
     // MARK: - Search State
     private val _nodesVisited = MutableStateFlow(0)
@@ -80,6 +113,7 @@ class ChessBitboardSearch(
     ) {
         this.timeLimitMs = timeLimitMs
         val softLimit = softTimeLimitMs ?: timeLimitMs
+        val effectiveMaxDepth = min(maxDepth, skillMaxDepth)
         this.startTimeMark = TimeSource.Monotonic.markNow()
         this.shouldStop = false
         this.localNodesVisited = 0
@@ -95,12 +129,13 @@ class ChessBitboardSearch(
         var previousScore: Int? = null
         var previousBestMove: BitboardChessMove? = null
 
-        for (depth in 1..maxDepth) {
+        for (depth in 1..effectiveMaxDepth) {
             _currentDepth.value = depth
+            transpositionTable.newGeneration()
             onProgress?.invoke(depth)
 
-            if (previousScore != null && depth >= 5) {
-                val window = 50
+            if (previousScore != null && depth >= 4) {
+                val window = 35
                 alpha = max(-INFINITY, previousScore!! - window)
                 beta = min(INFINITY, previousScore!! + window)
             } else {
@@ -147,7 +182,7 @@ class ChessBitboardSearch(
                      scoreString = "cp $score"
                  }
                  
-                 val pv = move.toString()
+                 val pv = move.toLAN()
                  val info = "info depth $depth score $scoreString nodes $localNodesVisited nps $nps pv $pv"
                  _searchInfo.value = info
                  println(info)
@@ -279,7 +314,31 @@ class ChessBitboardSearch(
 
         if (searchDepth <= 0) return quiescence(state, a, b, ply, 0)
 
-        if (currentDepth.value >= 6 && useNullMovePruning && !inCheck && searchDepth >= 3) {
+        // Static eval for pruning decisions (computed once, reused)
+        // Skill Level: add evaluation noise for weaker play
+        val noise = if (skillEvalNoise > 0) Random.nextInt(-skillEvalNoise, skillEvalNoise + 1) else 0
+        val staticEval = if (!inCheck && searchDepth <= 6) {
+            val eval = ChessEvaluation.evaluate(state, contempt)
+            (if (state.whiteToMove) eval else -eval) + noise
+        } else 0
+
+        // Reverse Futility Pruning: if eval is far above beta, prune
+        if (skillUseReverseFutility && !inCheck && searchDepth <= 6 && abs(b) < 90000) {
+            val rfpMargin = when (searchDepth) { 1 -> 200; 2 -> 400; 3 -> 600; 4 -> 800; 5 -> 1000; else -> 1200 }
+            if (staticEval - rfpMargin >= b) return (staticEval + b) / 2
+
+        }
+
+        // Razoring: if eval is far below alpha at shallow depth, drop to quiescence
+        if (skillUseRazoring && !inCheck && searchDepth <= 2 && abs(a) < 90000) {
+            val razorMargin = if (searchDepth == 1) 300 else 600
+            if (staticEval + razorMargin < a) {
+                val qScore = quiescence(state, a, b, ply, 0)
+                if (qScore < a) return qScore
+            }
+        }
+
+        if (skillUseNullMove && useNullMovePruning && !inCheck && searchDepth >= 3) {
             val nullState = state.copy()
             applyNullMove(nullState)
             val score = -negamax(nullState, searchDepth - 1 - 2, -b, -b + 1, ply + 1)
@@ -287,10 +346,13 @@ class ChessBitboardSearch(
         }
 
         var enableFutility = false
-        if (searchDepth <= 2 && !inCheck && abs(a) < 90000 && abs(b) < 90000) {
-            val margin = if (searchDepth == 1) 350 else 600
-            val eval = ChessEvaluation.evaluate(state, contempt)
-            val standPat = if (state.whiteToMove) eval else -eval
+        if (searchDepth <= 3 && !inCheck && abs(a) < 90000 && abs(b) < 90000) {
+            val margin = when (searchDepth) { 1 -> 350; 2 -> 600; else -> 900 }
+            // Reuse staticEval if available (depth <= 6), otherwise compute
+            val standPat = if (searchDepth <= 6) staticEval else {
+                val eval = ChessEvaluation.evaluate(state, contempt)
+                if (state.whiteToMove) eval else -eval
+            }
             if (standPat + margin < a) enableFutility = true
         }
 
@@ -309,7 +371,7 @@ class ChessBitboardSearch(
             legalMovesCount++
 
             val givesCheck = inCheck(nextState)
-            if (currentDepth.value >= 6 && !inCheck && searchDepth in 2..3 && !move.isCapture && !move.isPromotion && !givesCheck) {
+            if (!inCheck && searchDepth in 2..3 && !move.isCapture && !move.isPromotion && !givesCheck) {
                 if (legalMovesCount >= (3 + searchDepth * searchDepth)) continue
             }
             if (enableFutility && !move.isCapture && !move.isPromotion && !givesCheck) continue
@@ -319,7 +381,7 @@ class ChessBitboardSearch(
             var doFullSearch = true
             var score = 0
             
-            if (currentDepth.value >= 6 && searchDepth >= 3 && index >= 3 && !move.isCapture && !move.isPromotion && !inCheck && !givesCheck) {
+            if (skillUseLMR && searchDepth >= 3 && index >= 3 && !move.isCapture && !move.isPromotion && !inCheck && !givesCheck) {
                  val r = 1.0 + (ln(searchDepth.toDouble()) * ln(index.toDouble()) / 1.95)
                  var reduction = r.toInt()
                  if (reduction < 1) reduction = 1
@@ -371,26 +433,20 @@ class ChessBitboardSearch(
     }
 
     private fun quiescence(state: ChessBitboardGameState, alpha: Int, beta: Int, ply: Int, qsDepth: Int): Int {
+        localNodesVisited++
         if (localNodesVisited % 2048 == 0) {
              if ((startTimeMark?.elapsedNow()?.inWholeMilliseconds ?: 0L) > timeLimitMs) shouldStop = true
         }
         if (shouldStop) return 0
-        localNodesVisited++
 
         val inCheck = inCheck(state)
         var a = alpha
         var standPat = -INFINITY
-        
-        localNodesVisited++
-
-        if (localNodesVisited % 1024 == 0) {
-            if ((startTimeMark?.elapsedNow()?.inWholeMilliseconds ?: 0L) > timeLimitMs) shouldStop = true
-        }
-        if (shouldStop) return 0
 
         if (!inCheck) {
             val eval = ChessEvaluation.evaluate(state, contempt)
-            standPat = if (state.whiteToMove) eval else -eval
+            val qNoise = if (skillEvalNoise > 0) Random.nextInt(-skillEvalNoise, skillEvalNoise + 1) else 0
+            standPat = (if (state.whiteToMove) eval else -eval) + qNoise
             if (standPat >= beta) return beta
             if (standPat > a) a = standPat
         }
@@ -472,10 +528,11 @@ class ChessBitboardSearch(
     private fun updateHistory(move: BitboardChessMove, depth: Int) {
         val idx = move.from * 64 + move.to
         if(idx >= 4096) return
-        historyTable[idx] += depth * depth
-        if (historyTable[idx] > 20000) {
-            for (i in historyTable.indices) historyTable[i] /= 2
-        }
+        // Gravity-based aging: bonus is reduced as value grows (avoids global collapse)
+        val bonus = depth * depth
+        val current = historyTable[idx]
+        // Scale bonus down as history value grows (max ~8000)
+        historyTable[idx] = current + bonus - (current * bonus / 8192)
     }
 
     fun inCheck(state: ChessBitboardGameState): Boolean {

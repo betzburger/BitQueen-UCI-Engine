@@ -14,6 +14,8 @@ class ChessMultiCoreSearch(
 ) {
     private val workers = List(threadCount) { ChessBitboardSearch(tt) }
     
+    var skillLevel: Int = 20
+
     private val _bestMove = MutableStateFlow<BitboardChessMove?>(null)
     val bestMove = _bestMove.asStateFlow()
     
@@ -31,12 +33,12 @@ class ChessMultiCoreSearch(
         contempt: Int = 0,
         onProgress: ((Int) -> Unit)? = null
     ) = coroutineScope {
-        println("DEBUG: Starting MultiCore Search with $threadCount workers.")
+        // (debug log removed — non-UCI-compliant output broke GUI parsers)
         _bestMove.value = null
         _currentDepth.value = 0
         
-        // Set contempt on all workers
-        workers.forEach { it.contempt = contempt }
+        // Set contempt and skill level on all workers
+        workers.forEach { it.contempt = contempt; it.skillLevel = skillLevel }
         
         val jobs = mutableListOf<Job>()
         
@@ -61,12 +63,15 @@ class ChessMultiCoreSearch(
             jobs.forEach { if (it != this) it.cancel() }
         }
         
-        // Launch helper workers
+        // Launch helper workers with depth diversity for better TT filling
         for (i in 1 until workers.size) {
             val worker = workers[i]
+            // Alternate: odd helpers search +1 depth, even helpers search same depth
+            // This explores different parts of the search tree
+            val depthOffset = if (i % 2 == 1) 1 else 0
+            val helperMaxDepth = maxDepth + depthOffset
             jobs += launch(Dispatchers.Default) {
-                // Helpers might search with slightly different parameters or just help fill TT
-                worker.startSearch(state, history, timeLimitMs, null, maxDepth, output = false)
+                worker.startSearch(state, history, timeLimitMs, null, helperMaxDepth, output = false)
             }
         }
         

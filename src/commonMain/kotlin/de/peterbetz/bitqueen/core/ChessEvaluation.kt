@@ -199,7 +199,64 @@
 
     data class Score(var mg: Int = 0, var eg: Int = 0, var phase: Int = 0)
 
+    // Chess 4.6 MBTAB: detect known drawn endgames
+    private fun isInsufficientMaterial(state: ChessBitboardGameState): Boolean {
+        // If any pawns, rooks, or queens exist, material is sufficient
+        if (state.wP.rawValue != 0uL || state.bP.rawValue != 0uL) return false
+        if (state.wR.rawValue != 0uL || state.bR.rawValue != 0uL) return false
+        if (state.wQ.rawValue != 0uL || state.bQ.rawValue != 0uL) return false
+
+        val wN = state.wN.popCount; val wB = state.wB.popCount
+        val bN = state.bN.popCount; val bB = state.bB.popCount
+        val wMinor = wN + wB; val bMinor = bN + bB
+
+        // K vs K
+        if (wMinor == 0 && bMinor == 0) return true
+        // K+B vs K or K+N vs K
+        if (wMinor == 0 && bMinor == 1) return true
+        if (wMinor == 1 && bMinor == 0) return true
+        // K+N+N vs K (cannot force mate)
+        if (wN == 2 && wB == 0 && bMinor == 0) return true
+        if (bN == 2 && bB == 0 && wMinor == 0) return true
+        // K+B vs K+B same colored bishops
+        if (wB == 1 && bB == 1 && wN == 0 && bN == 0) {
+            val wBSq = state.wB.lsbIndex ?: return false
+            val bBSq = state.bB.lsbIndex ?: return false
+            val wBColor = (wBSq / 8 + wBSq % 8) % 2
+            val bBColor = (bBSq / 8 + bBSq % 8) % 2
+            if (wBColor == bBColor) return true
+        }
+        return false
+    }
+
+    // Chess 4.6: scale score toward draw when winning side has barely enough material
+    private fun scaleFactor(state: ChessBitboardGameState, rawScore: Int): Int {
+        if (rawScore == 0) return rawScore
+
+        val dominated = rawScore > 0 // white winning
+        val wP = state.wP.popCount; val bP = state.bP.popCount
+        val wN = state.wN.popCount; val wB = state.wB.popCount
+        val wR = state.wR.popCount; val wQ = state.wQ.popCount
+        val bN = state.bN.popCount; val bB = state.bB.popCount
+        val bR = state.bR.popCount; val bQ = state.bQ.popCount
+
+        // Winning side has no pawns and only minor piece advantage: scale down
+        if (dominated) {
+            if (wP == 0 && wQ == 0 && wR == 0 && (wN + wB) <= 1 && bQ == 0 && bR == 0) {
+                return rawScore / 4 // very hard to win with lone minor vs minors
+            }
+        } else {
+            if (bP == 0 && bQ == 0 && bR == 0 && (bN + bB) <= 1 && wQ == 0 && wR == 0) {
+                return rawScore / 4
+            }
+        }
+        return rawScore
+    }
+
     fun evaluate(state: ChessBitboardGameState, contempt: Int = 0): Int {
+        // Chess 4.6: known drawn endgames return draw score immediately
+        if (isInsufficientMaterial(state)) return 0
+
         val score = Score()
         val moveGen = ChessBitboardMoveGenerator
 
@@ -224,15 +281,20 @@
         evaluateKingSafety(state, moveGen, false, score)
 
         evaluateStrategicTerms(state, moveGen, score)
+        evaluateTropism(state, score)
         evaluateMobility(state, moveGen, score)
+        evaluateTradeDown(state, score)
         evaluateMopUp(state, score)
 
         val phase = min(score.phase, totalPhase)
         var finalScore = ((score.mg * phase) + (score.eg * (totalPhase - phase))) / totalPhase
-        
+
+        // Chess 4.6: scale toward draw when winning side has minimal material
+        finalScore = scaleFactor(state, finalScore)
+
         // Apply contempt (positive for side to move)
         finalScore += if (state.whiteToMove) contempt else -contempt
-        
+
         val tempo = 10
         return finalScore + (if (state.whiteToMove) tempo else -tempo)
     }
@@ -344,14 +406,27 @@
          val openFileBonusEG = 10
          val semiOpenBonusMG = 10
          val semiOpenBonusEG = 5
+         // Chess 4.6: rook on 7th rank bonus
+         val rookOn7thMG = 25
+         val rookOn7thEG = 40
+         // Chess 4.6: doubled rooks bonus
+         val doubledRooksMG = 15
+         val doubledRooksEG = 25
+
+         // Track which files have white/black rooks for doubled detection
+         var wRookFiles = 0 // bitmask of files
+         var bRookFiles = 0
+         var wRookFileDup = 0 // files with >1 rook
+         var bRookFileDup = 0
 
          var wR = state.wR
          while(true) {
              val (newR, sq) = wR.popLSB()
              wR = newR
              if(sq == null) break
-             
+
              val file = sq!! % 8
+             val rank = sq / 8
              val fileMask = fileMasks[file]
              val anyPawn = (state.wP.rawValue or state.bP.rawValue) and fileMask
              if(anyPawn == 0uL) {
@@ -361,15 +436,24 @@
                      score.mg += semiOpenBonusMG; score.eg += semiOpenBonusEG
                  }
              }
+             // Rook on 7th rank (rank index 6 for white)
+             if(rank == 6) {
+                 score.mg += rookOn7thMG; score.eg += rookOn7thEG
+             }
+             // Doubled rooks detection
+             val fileBit = 1 shl file
+             if((wRookFiles and fileBit) != 0) wRookFileDup = wRookFileDup or fileBit
+             wRookFiles = wRookFiles or fileBit
          }
-         
+
          var bR = state.bR
          while(true) {
              val (newR, sq) = bR.popLSB()
              bR = newR
              if(sq == null) break
-             
+
              val file = sq!! % 8
+             val rank = sq / 8
              val fileMask = fileMasks[file]
              val anyPawn = (state.wP.rawValue or state.bP.rawValue) and fileMask
              if(anyPawn == 0uL) {
@@ -379,6 +463,26 @@
                      score.mg -= semiOpenBonusMG; score.eg -= semiOpenBonusEG
                  }
              }
+             // Rook on 2nd rank (rank index 1 for black = "7th rank" from black's view)
+             if(rank == 1) {
+                 score.mg -= rookOn7thMG; score.eg -= rookOn7thEG
+             }
+             // Doubled rooks detection
+             val fileBit = 1 shl file
+             if((bRookFiles and fileBit) != 0) bRookFileDup = bRookFileDup or fileBit
+             bRookFiles = bRookFiles or fileBit
+         }
+
+         // Award doubled rooks bonuses (count set bits in dup mask)
+         var wd = wRookFileDup
+         while(wd != 0) {
+             score.mg += doubledRooksMG; score.eg += doubledRooksEG
+             wd = wd and (wd - 1) // clear lowest set bit
+         }
+         var bd = bRookFileDup
+         while(bd != 0) {
+             score.mg -= doubledRooksMG; score.eg -= doubledRooksEG
+             bd = bd and (bd - 1) // clear lowest set bit
          }
     }
 
@@ -411,7 +515,27 @@
             score.mg -= penalty // Black penalty -> White Advantage
         }
 
+        // Chess 4.6: open file next to king penalty (FKSOPF)
+        for(f in max(0, file-1)..min(7, file+1)) {
+            val fMask = fileMasks[f]
+            val anyPawn = (state.wP.rawValue or state.bP.rawValue) and fMask
+            if(anyPawn == 0uL) {
+                // Fully open file adjacent to or on king
+                val penalty = if(f == file) 30 else 15
+                if(isWhite) score.mg -= penalty else score.mg += penalty
+            } else {
+                val ownPawns = if(isWhite) state.wP.rawValue else state.bP.rawValue
+                if((ownPawns and fMask) == 0uL) {
+                    // Semi-open file (no own pawns)
+                    val penalty = if(f == file) 15 else 8
+                    if(isWhite) score.mg -= penalty else score.mg += penalty
+                }
+            }
+        }
+
         // 2. Attackers
+        // Chess 4.6: skip expensive attack calculation if enemy has no queen (FKSQBN)
+        val enemyQueens = if(isWhite) state.bQ else state.wQ
         val enemyPieces = if(isWhite) state.blackOccupied else state.whiteOccupied
         if(enemyPieces.popCount < 2) return
 
@@ -423,7 +547,6 @@
         val enemyKnights = if(isWhite) state.bN else state.wN
         val enemyBishops = if(isWhite) state.bB else state.wB
         val enemyRooks = if(isWhite) state.bR else state.wR
-        val enemyQueens = if(isWhite) state.bQ else state.wQ
 
         val occupied = state.allOccupied
 
@@ -451,7 +574,11 @@
 
         if(attackersCount > 1) {
             val index = min(safetyTable.size - 1, attackUnits + (attackersCount * 2))
-            val penalty = safetyTable[index]
+            var penalty = safetyTable[index]
+            // Chess 4.6: queen presence amplifies king danger (FKSQBN)
+            if(enemyQueens.rawValue == 0uL) {
+                penalty = penalty / 3 // much less dangerous without queen
+            }
             if(isWhite) score.mg -= penalty else score.mg += penalty
         }
     }
@@ -462,6 +589,19 @@
 
         if(state.wB.popCount >= 2) { score.mg += bishopPairMG; score.eg += bishopPairEG }
         if(state.bB.popCount >= 2) { score.mg -= bishopPairMG; score.eg -= bishopPairEG }
+
+        // Chess 4.6: penalty for knights/bishops on back rank (FNBKRK, FBBKRK)
+        val backRankPenalty = -15
+        val rank1Mask = rankMasks[0] // white back rank
+        val rank8Mask = rankMasks[7] // black back rank
+        val wNBackRank = (state.wN and ChessBitboard(rank1Mask)).popCount
+        val wBBackRank = (state.wB and ChessBitboard(rank1Mask)).popCount
+        val bNBackRank = (state.bN and ChessBitboard(rank8Mask)).popCount
+        val bBBackRank = (state.bB and ChessBitboard(rank8Mask)).popCount
+        score.mg += wNBackRank * backRankPenalty
+        score.mg += wBBackRank * backRankPenalty
+        score.mg -= bNBackRank * backRankPenalty
+        score.mg -= bBBackRank * backRankPenalty
 
         val outpostBonus = 30
         var wN = state.wN
@@ -521,6 +661,77 @@
         }
         count(1, true, state.wN); count(2, true, state.wB); count(3, true, state.wR); count(4, true, state.wQ)
         count(1, false, state.bN); count(2, false, state.bB); count(3, false, state.bR); count(4, false, state.bQ)
+    }
+
+    // Chess 4.6 Tropism: bonus for pieces closer to the enemy king
+    private fun evaluateTropism(state: ChessBitboardGameState, score: Score) {
+        val wKingSq = state.bK.lsbIndex ?: return // target: enemy king
+        val bKingSq = state.wK.lsbIndex ?: return
+        val wKFile = wKingSq % 8; val wKRank = wKingSq / 8
+        val bKFile = bKingSq % 8; val bKRank = bKingSq / 8
+
+        // Knight tropism (strongest effect per Chess 4.6)
+        var wN = state.wN
+        while (true) {
+            val (n, sq) = wN.popLSB(); wN = n; if (sq == null) break
+            val dist = max(abs(sq!! % 8 - wKFile), abs(sq / 8 - wKRank))
+            score.mg += (7 - dist) * 3; score.eg += (7 - dist) * 2
+        }
+        var bN = state.bN
+        while (true) {
+            val (n, sq) = bN.popLSB(); bN = n; if (sq == null) break
+            val dist = max(abs(sq!! % 8 - bKFile), abs(sq / 8 - bKRank))
+            score.mg -= (7 - dist) * 3; score.eg -= (7 - dist) * 2
+        }
+
+        // Rook tropism
+        var wR = state.wR
+        while (true) {
+            val (n, sq) = wR.popLSB(); wR = n; if (sq == null) break
+            val dist = max(abs(sq!! % 8 - wKFile), abs(sq / 8 - wKRank))
+            score.mg += (7 - dist) * 2; score.eg += (7 - dist) * 2
+        }
+        var bR = state.bR
+        while (true) {
+            val (n, sq) = bR.popLSB(); bR = n; if (sq == null) break
+            val dist = max(abs(sq!! % 8 - bKFile), abs(sq / 8 - bKRank))
+            score.mg -= (7 - dist) * 2; score.eg -= (7 - dist) * 2
+        }
+
+        // Queen tropism
+        var wQ = state.wQ
+        while (true) {
+            val (n, sq) = wQ.popLSB(); wQ = n; if (sq == null) break
+            val dist = max(abs(sq!! % 8 - wKFile), abs(sq / 8 - wKRank))
+            score.mg += (7 - dist) * 2; score.eg += (7 - dist) * 1
+        }
+        var bQ = state.bQ
+        while (true) {
+            val (n, sq) = bQ.popLSB(); bQ = n; if (sq == null) break
+            val dist = max(abs(sq!! % 8 - bKFile), abs(sq / 8 - bKRank))
+            score.mg -= (7 - dist) * 2; score.eg -= (7 - dist) * 1
+        }
+    }
+
+    // Chess 4.6 Trade-Down: when ahead in material, reward piece exchanges
+    private fun evaluateTradeDown(state: ChessBitboardGameState, score: Score) {
+        val wPieceCount = state.wN.popCount + state.wB.popCount + state.wR.popCount + state.wQ.popCount
+        val bPieceCount = state.bN.popCount + state.bB.popCount + state.bR.popCount + state.bQ.popCount
+        val totalPieces = wPieceCount + bPieceCount // max ~14 at start (no pawns/kings)
+
+        // Approximate material in centipawns (without pawns, which should NOT be traded)
+        val wMat = state.wN.popCount * 320 + state.wB.popCount * 330 + state.wR.popCount * 500 + state.wQ.popCount * 900
+        val bMat = state.bN.popCount * 320 + state.bB.popCount * 330 + state.bR.popCount * 500 + state.bQ.popCount * 900
+        val materialEdge = wMat - bMat
+
+        if (materialEdge == 0) return
+
+        // Pieces traded away from the starting 14
+        val piecesTraded = 14 - totalPieces
+        // Trade-down bonus scales with material advantage and pieces already traded
+        val tradeBonus = materialEdge * piecesTraded / 28 // ~half-pawn max at full advantage
+        score.mg += tradeBonus / 3
+        score.eg += tradeBonus / 2
     }
 
     private fun evaluateMopUp(state: ChessBitboardGameState, score: Score) {
