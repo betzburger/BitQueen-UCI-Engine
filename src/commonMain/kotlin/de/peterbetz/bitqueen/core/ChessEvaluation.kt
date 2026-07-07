@@ -367,7 +367,14 @@
             }
             // Passed
             if ((bP.rawValue and whitePassedMasks[sq]) == 0uL) {
-                score.mg += passedBonusMG[rank]; score.eg += passedBonusEG[rank]
+                var pmg = passedBonusMG[rank]
+                var peg = passedBonusEG[rank]
+                val stopSq = sq + 8
+                if (stopSq in 0..63 && state.blackOccupied.isSet(stopSq)) {
+                    pmg = pmg * 7 / 10
+                    peg = peg * 7 / 10
+                }
+                score.mg += pmg; score.eg += peg
             }
         }
 
@@ -399,7 +406,14 @@
             // Passed
             if ((wP.rawValue and blackPassedMasks[sq]) == 0uL) {
                 val whiteRank = 7 - rank
-                score.mg -= passedBonusMG[whiteRank]; score.eg -= passedBonusEG[whiteRank]
+                var pmg = passedBonusMG[whiteRank]
+                var peg = passedBonusEG[whiteRank]
+                val stopSq = sq - 8
+                if (stopSq in 0..63 && state.whiteOccupied.isSet(stopSq)) {
+                    pmg = pmg * 7 / 10
+                    peg = peg * 7 / 10
+                }
+                score.mg -= pmg; score.eg -= peg
             }
         }
     }
@@ -629,10 +643,24 @@
         }
     }
 
+    private fun allPawnAttacks(pawns: ChessBitboard, white: Boolean): ULong {
+        // Parallel pawn attack generation
+        val p = pawns.rawValue
+        val notA = 0xfefefefefefefefeuL
+        val notH = 0x7f7f7f7f7f7f7f7fuL
+        return if (white) {
+            ((p and notA) shl 7) or ((p and notH) shl 9)
+        } else {
+            ((p and notA) shr 9) or ((p and notH) shr 7)
+        }
+    }
+
     private fun evaluateMobility(state: ChessBitboardGameState, moveGen: ChessBitboardMoveGenerator, score: Score) {
         val occupied = state.allOccupied
         val whiteUs = state.whiteOccupied
         val blackUs = state.blackOccupied
+        val enemyPawnAttacksForWhite = allPawnAttacks(state.bP, false)
+        val enemyPawnAttacksForBlack = allPawnAttacks(state.wP, true)
 
         val mob = intArrayOf(0, 4, 3, 2, 1) // P, N, B, R, Q (Custom indices for types?) No, type is 1..4.
         // Types in evaluatePieces: N=1, B=2, R=3, Q=4
@@ -651,7 +679,8 @@
                     4 -> moveGen.getBishopAttacks(sq!!, occupied) or moveGen.getRookAttacks(sq, occupied)
                     else -> ChessBitboard.EMPTY
                 }
-                val safeAttacks = attacks and (if(isWhite) whiteUs else blackUs).inv()
+                val enemyPawnAttackMask = if(isWhite) enemyPawnAttacksForWhite else enemyPawnAttacksForBlack
+                val safeAttacks = attacks and (if(isWhite) whiteUs else blackUs).inv() and ChessBitboard(enemyPawnAttackMask.inv())
                 val cnt = safeAttacks.popCount
                 if(isWhite) {
                     score.mg += cnt * mobValMG[pt]

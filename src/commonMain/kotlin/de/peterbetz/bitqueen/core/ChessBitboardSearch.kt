@@ -80,11 +80,34 @@ class ChessBitboardSearch(
 
     // Heuristics
     private val killerMoves = Array(64) { arrayOfNulls<BitboardChessMove>(2) }
-    private val historyTable = IntArray(4096) // 64*64
+    // Butterfly history indexed by side-to-move: [stm][from*64+to]
+    private val historyTable = Array(2) { IntArray(4096) } // [stm][64*64]
+    // Counter-move table indexed by previous move's from/to
+    private val counterMoves = Array(64) { arrayOfNulls<BitboardChessMove>(64) }
+
+    // LMR reduction table: lmrTable[depth][moveIndex]
+    private val LMR_MAX_DEPTH = 64
+    private val LMR_MAX_MOVES = 64
+    private val lmrTable: Array<IntArray> = Array(LMR_MAX_DEPTH) { d ->
+        IntArray(LMR_MAX_MOVES) { m ->
+            if (d < 1 || m < 1) 1
+            else {
+                val r = 0.8 + ln(d.toDouble()) * ln(m.toDouble()) / 2.25
+                r.toInt().coerceAtLeast(1)
+            }
+        }
+    }
 
     // Constants
     private val INFINITY = 1000000
     private val MATE_SCORE = 100000
+    // SEE piece values (indexed by ChessPieceType ordinal-like mapping via getPieceValue)
+    private val SEE_PAWN = 100
+    private val SEE_KNIGHT = 320
+    private val SEE_BISHOP = 330
+    private val SEE_ROOK = 500
+    private val SEE_QUEEN = 900
+    private val SEE_KING = 10000
 
     enum class TTFlag(val value: Byte) {
         EXACT(0),
@@ -98,8 +121,10 @@ class ChessBitboardSearch(
 
     fun clearTT() {
         transpositionTable.clear()
-        historyTable.fill(0)
+        historyTable[0].fill(0)
+        historyTable[1].fill(0)
         for(row in killerMoves) row.fill(null)
+        for(row in counterMoves) row.fill(null)
     }
 
     fun startSearch(
@@ -235,7 +260,7 @@ class ChessBitboardSearch(
             legalMoveFound = true
 
             searchStack.add(nextState.hash)
-            val score = -negamax(nextState, depth - 1, -beta, -a, 1)
+            val score = -negamax(nextState, depth - 1, -beta, -a, 1, move)
             searchStack.removeAt(searchStack.lastIndex)
 
             if (shouldStop) return null
@@ -260,7 +285,7 @@ class ChessBitboardSearch(
         return null
     }
 
-    private fun negamax(state: ChessBitboardGameState, depth: Int, alpha: Int, beta: Int, ply: Int): Int {
+    private fun negamax(state: ChessBitboardGameState, depth: Int, alpha: Int, beta: Int, ply: Int, prevMove: BitboardChessMove? = null): Int {
         if (localNodesVisited % 1024 == 0) {
             if ((startTimeMark?.elapsedNow()?.inWholeMilliseconds ?: 0L) > timeLimitMs) shouldStop = true
         }
@@ -305,7 +330,7 @@ class ChessBitboardSearch(
         }
 
         if (depth >= 4 && !hasTTMove) {
-            negamax(state, depth - 2, a, b, ply)
+            negamax(state, depth - 2, a, b, ply, prevMove)
             val iidEntry = transpositionTable.get(state.hash)
             if (iidEntry != null && iidEntry.moveFrom != 0) {
                 ttMovePacked = iidEntry.moveFrom
@@ -319,55 +344,56 @@ class ChessBitboardSearch(
 
         if (searchDepth <= 0) return quiescence(state, a, b, ply, 0)
 
+        val isPvNode = (b - a > 1)
+
         // Static eval for pruning decisions (computed once, reused)
         // Skill Level: add evaluation noise for weaker play
         val noise = if (skillEvalNoise > 0) Random.nextInt(-skillEvalNoise, skillEvalNoise + 1) else 0
-        val staticEval = if (!inCheck && searchDepth <= 6) {
+        val staticEval = if (!inCheck) {
             val eval = ChessEvaluation.evaluate(state, contempt)
             (if (state.whiteToMove) eval else -eval) + noise
         } else 0
 
-        // Reverse Futility Pruning: if eval is far above beta, prune
-        if (skillUseReverseFutility && !inCheck && searchDepth <= 6 && abs(b) < 90000) {
-            val rfpMargin = when (searchDepth) { 1 -> 200; 2 -> 400; 3 -> 600; 4 -> 800; 5 -> 1000; else -> 1200 }
+        // Reverse Futility Pruning: linear 75*depth
+        if (skillUseReverseFutility && !inCheck && searchDepth <= 8 && abs(b) < 90000) {
+            val rfpMargin = 75 * searchDepth
             if (staticEval - rfpMargin >= b) return (staticEval + b) / 2
-
         }
 
-        // Razoring: if eval is far below alpha at shallow depth, drop to quiescence
+        // Razoring: if eval + 200 + 200*depth is still below alpha at shallow depth, drop to quiescence
         if (skillUseRazoring && !inCheck && searchDepth <= 2 && abs(a) < 90000) {
-            val razorMargin = if (searchDepth == 1) 300 else 600
+            val razorMargin = 200 + 200 * searchDepth
             if (staticEval + razorMargin < a) {
                 val qScore = quiescence(state, a, b, ply, 0)
                 if (qScore < a) return qScore
             }
         }
 
-        if (skillUseNullMove && useNullMovePruning && !inCheck && searchDepth >= 3 && hasNonPawnMaterial(state)) {
+        // Adaptive Null Move Pruning
+        if (skillUseNullMove && useNullMovePruning && !inCheck && searchDepth >= 3 && hasNonPawnMaterial(state) && abs(b) < 90000) {
+            val rAdaptive = (3 + searchDepth / 4 + min((staticEval - b) / 200, 3)).coerceAtLeast(2)
             val nullState = state.copy()
             applyNullMove(nullState)
-            val score = -negamax(nullState, searchDepth - 1 - 2, -b, -b + 1, ply + 1)
+            val score = -negamax(nullState, (searchDepth - 1 - rAdaptive).coerceAtLeast(0), -b, -b + 1, ply + 1, null)
             if (score >= b) return b
         }
 
         var enableFutility = false
         if (searchDepth <= 3 && !inCheck && abs(a) < 90000 && abs(b) < 90000) {
             val margin = when (searchDepth) { 1 -> 350; 2 -> 600; else -> 900 }
-            // Reuse staticEval if available (depth <= 6), otherwise compute
-            val standPat = if (searchDepth <= 6) staticEval else {
-                val eval = ChessEvaluation.evaluate(state, contempt)
-                if (state.whiteToMove) eval else -eval
-            }
-            if (standPat + margin < a) enableFutility = true
+            if (staticEval + margin < a) enableFutility = true
         }
 
         val moves = moveGenerator.generateMoves(state).toMutableList()
-        scoreMoves(moves, ttMovePacked, ply, state)
+        scoreMoves(moves, ttMovePacked, ply, state, prevMove)
         moves.sortByDescending { it.score }
 
         var bestScore = -INFINITY
         var bestMovePacked = 0
+        var bestMoveRef: BitboardChessMove? = null
         var legalMovesCount = 0
+        var legalQuietsVisited = 0
+        val triedQuiets = ArrayList<BitboardChessMove>(16)
 
         for ((index, move) in moves.withIndex()) {
             val nextState = state.copy()
@@ -375,36 +401,59 @@ class ChessBitboardSearch(
             if (isIllegal(nextState)) continue
             legalMovesCount++
 
+            val isQuiet = !move.isCapture && !move.isPromotion
             val givesCheck = inCheck(nextState)
-            if (!inCheck && searchDepth in 2..3 && !move.isCapture && !move.isPromotion && !givesCheck) {
-                if (legalMovesCount >= (3 + searchDepth * searchDepth)) continue
+
+            // Late Move Pruning (LMP): at shallow depth, skip quiets after a threshold
+            if (!inCheck && isQuiet && !givesCheck && searchDepth <= 4 && bestScore > -90000) {
+                val lmpLimit = when (searchDepth) { 1 -> 4; 2 -> 8; 3 -> 14; else -> 22 }
+                if (legalQuietsVisited >= lmpLimit) { continue }
             }
-            if (enableFutility && !move.isCapture && !move.isPromotion && !givesCheck) continue
+
+            if (enableFutility && isQuiet && !givesCheck) continue
+
+            if (isQuiet) {
+                legalQuietsVisited++
+                triedQuiets.add(move)
+            }
 
             searchStack.add(nextState.hash)
 
-            var doFullSearch = true
-            var score = 0
-            
-            if (skillUseLMR && searchDepth >= 3 && index >= 3 && !move.isCapture && !move.isPromotion && !inCheck && !givesCheck) {
-                 val r = 1.0 + (ln(searchDepth.toDouble()) * ln(index.toDouble()) / 1.95)
-                 var reduction = r.toInt()
-                 if (reduction < 1) reduction = 1
-                 score = -negamax(nextState, searchDepth - 1 - reduction, -a - 1, -a, ply + 1)
-                 if (score > a) doFullSearch = true else doFullSearch = false
+            var score: Int
+            var reduction = 0
+            var didLMR = false
+
+            if (skillUseLMR && searchDepth >= 3 && index >= 2 && isQuiet && !inCheck && !givesCheck) {
+                val depthIdx = if (searchDepth < LMR_MAX_DEPTH) searchDepth else LMR_MAX_DEPTH - 1
+                val moveIdx = if (index < LMR_MAX_MOVES) index else LMR_MAX_MOVES - 1
+                reduction = lmrTable[depthIdx][moveIdx]
+                val hIdx = move.from * 64 + move.to
+                val stmIdx = if (state.whiteToMove) 0 else 1
+                if (historyTable[stmIdx][hIdx] < 0) reduction += 1
+                if (isPvNode && reduction > 1) reduction = 1
+                if (reduction < 1) reduction = 1
+                didLMR = true
             }
 
-            if (doFullSearch) {
-                if (legalMovesCount == 1) {
-                    score = -negamax(nextState, searchDepth - 1, -b, -a, ply + 1)
-                } else {
-                    score = -negamax(nextState, searchDepth - 1, -a - 1, -a, ply + 1)
-                    if (score > a && score < b) {
-                        score = -negamax(nextState, searchDepth - 1, -b, -a, ply + 1)
-                    }
+            if (didLMR) {
+                val reducedDepth = (searchDepth - 1 - reduction).coerceAtLeast(0)
+                score = -negamax(nextState, reducedDepth, -a - 1, -a, ply + 1, move)
+                if (score > a && reduction > 1) {
+                    // Full-depth zero-window re-search before full-window re-search
+                    score = -negamax(nextState, searchDepth - 1, -a - 1, -a, ply + 1, move)
+                }
+                if (score > a && score < b) {
+                    score = -negamax(nextState, searchDepth - 1, -b, -a, ply + 1, move)
                 }
             } else {
-                score = a
+                if (legalMovesCount == 1) {
+                    score = -negamax(nextState, searchDepth - 1, -b, -a, ply + 1, move)
+                } else {
+                    score = -negamax(nextState, searchDepth - 1, -a - 1, -a, ply + 1, move)
+                    if (score > a && score < b) {
+                        score = -negamax(nextState, searchDepth - 1, -b, -a, ply + 1, move)
+                    }
+                }
             }
 
             searchStack.removeAt(searchStack.lastIndex)
@@ -413,14 +462,24 @@ class ChessBitboardSearch(
             if (score > bestScore) {
                 bestScore = score
                 bestMovePacked = packMove(move)
+                bestMoveRef = move
             }
             if (score > a) {
                 a = score
             }
             if (a >= b) {
-                if (!move.isCapture) {
+                val stmIdx = if (state.whiteToMove) 0 else 1
+                if (isQuiet) {
                     updateKiller(move, ply)
-                    updateHistory(move, searchDepth)
+                    updateHistory(move, searchDepth, stmIdx)
+                    // Penalize all other tried quiets
+                    for (q in triedQuiets) {
+                        if (!sameMove(q, move)) penalizeHistory(q, searchDepth, stmIdx)
+                    }
+                    // Store counter-move
+                    if (prevMove != null) {
+                        counterMoves[prevMove.from][prevMove.to] = move
+                    }
                 }
                 var storeScore = score
                 if (storeScore > 90000) storeScore += ply
@@ -472,9 +531,12 @@ class ChessBitboardSearch(
             if (!potentiallyInteresting && qsDepth > 0) continue
 
             if (!inCheck && move.isCapture && !move.isPromotion) {
-                 val victim = getPieceType(move.to, !state.whiteToMove, state)
+                 val victim = if (move.flag == ChessMoveFlag.EP_CAPTURE) ChessPieceType.PAWN
+                              else getPieceType(move.to, !state.whiteToMove, state)
                  val victimVal = getPieceValue(victim)
                  if (standPat + victimVal + 200 < a) continue
+                 // SEE pruning: skip losing captures
+                 if (see(state, move) < 0) continue
             }
 
             val nextState = state.copy()
@@ -505,24 +567,37 @@ class ChessBitboardSearch(
         return (move.from shl 6) or move.to
     }
 
-    private fun scoreMoves(moves: MutableList<BitboardChessMove>, ttMovePacked: Int, ply: Int, state: ChessBitboardGameState) {
+    private fun scoreMoves(moves: MutableList<BitboardChessMove>, ttMovePacked: Int, ply: Int, state: ChessBitboardGameState, prevMove: BitboardChessMove? = null) {
         val ttFrom = if(ttMovePacked != 0) (ttMovePacked shr 6) and 0x3F else -1
         val ttTo = if(ttMovePacked != 0) ttMovePacked and 0x3F else -1
-        
+        val stm = if (state.whiteToMove) 0 else 1
+        val counter: BitboardChessMove? = if (prevMove != null) counterMoves[prevMove.from][prevMove.to] else null
+
         for(move in moves) {
             var score = 0
             if(move.from == ttFrom && move.to == ttTo) {
                 score = 20000
             } else if(move.isCapture) {
-                val victim = getPieceType(move.to, !state.whiteToMove, state)
+                val victim = if (move.flag == ChessMoveFlag.EP_CAPTURE) ChessPieceType.PAWN
+                             else getPieceType(move.to, !state.whiteToMove, state)
                 val attacker = getPieceType(move.from, state.whiteToMove, state)
-                score = 10000 + (getPieceValue(victim) * 10) - getPieceValue(attacker)
+                val mvvLva = (getPieceValue(victim) * 10) - getPieceValue(attacker)
+                // MVV-LVA shortcut: if attacker value <= victim value, capture is surely non-losing
+                val attV = getPieceValue(attacker)
+                val vicV = getPieceValue(victim)
+                if (attV <= vicV) {
+                    score = 10000 + mvvLva
+                } else {
+                    val seeScore = see(state, move)
+                    score = if (seeScore >= 0) 10000 + mvvLva else -10000 + mvvLva
+                }
             } else {
                 if(ply < 64 && sameMove(killerMoves[ply][0], move)) score = 9000
                 else if(ply < 64 && sameMove(killerMoves[ply][1], move)) score = 8000
+                else if(counter != null && sameMove(counter, move)) score = 7500
                 else {
                    val idx = move.from * 64 + move.to
-                   score = historyTable.getOrElse(idx) { 0 }
+                   score = historyTable[stm][idx]
                 }
             }
             move.score = score
@@ -549,14 +624,159 @@ class ChessBitboardSearch(
         killerMoves[ply][0] = move
     }
 
-    private fun updateHistory(move: BitboardChessMove, depth: Int) {
+    private fun updateHistory(move: BitboardChessMove, depth: Int, stm: Int) {
         val idx = move.from * 64 + move.to
         if(idx >= 4096) return
-        // Gravity-based aging: bonus is reduced as value grows (avoids global collapse)
         val bonus = depth * depth
-        val current = historyTable[idx]
-        // Scale bonus down as history value grows (max ~8000)
-        historyTable[idx] = current + bonus - (current * bonus / 8192)
+        val current = historyTable[stm][idx]
+        historyTable[stm][idx] = current + bonus - (current * bonus / 8192)
+    }
+
+    private fun penalizeHistory(move: BitboardChessMove, depth: Int, stm: Int) {
+        val idx = move.from * 64 + move.to
+        if(idx >= 4096) return
+        val malus = depth * depth
+        val current = historyTable[stm][idx]
+        historyTable[stm][idx] = current - malus - (current * malus / 8192)
+    }
+
+    // --- Static Exchange Evaluation ---
+
+    private fun pieceValueForSEE(type: ChessPieceType): Int = when(type) {
+        ChessPieceType.PAWN -> SEE_PAWN
+        ChessPieceType.KNIGHT -> SEE_KNIGHT
+        ChessPieceType.BISHOP -> SEE_BISHOP
+        ChessPieceType.ROOK -> SEE_ROOK
+        ChessPieceType.QUEEN -> SEE_QUEEN
+        ChessPieceType.KING -> SEE_KING
+        else -> 0
+    }
+
+    /**
+     * Bitboard of all pieces (both colors) attacking `sq`, given occupancy `occ`.
+     * Used for SEE x-ray handling.
+     */
+    private fun attackersTo(sq: Int, state: ChessBitboardGameState, occ: ULong): ULong {
+        var attackers: ULong = 0uL
+        // Pawns: white pawns attack sq if a black-pawn-attack-from-sq hits a white pawn (and vice versa)
+        val wPawnAttackers = moveGenerator.getPawnAttacks(sq, false).rawValue and state.wP.rawValue
+        val bPawnAttackers = moveGenerator.getPawnAttacks(sq, true).rawValue and state.bP.rawValue
+        attackers = attackers or wPawnAttackers or bPawnAttackers
+        // Knights
+        attackers = attackers or (moveGenerator.getKnightAttacks(sq).rawValue and (state.wN.rawValue or state.bN.rawValue))
+        // Kings
+        attackers = attackers or (moveGenerator.getKingAttacks(sq).rawValue and (state.wK.rawValue or state.bK.rawValue))
+        // Bishops / Queens (diagonal) using given occ
+        val bishopLike = moveGenerator.getBishopAttacks(sq, ChessBitboard(occ)).rawValue
+        attackers = attackers or (bishopLike and (state.wB.rawValue or state.wQ.rawValue or state.bB.rawValue or state.bQ.rawValue))
+        // Rooks / Queens (orthogonal) using given occ
+        val rookLike = moveGenerator.getRookAttacks(sq, ChessBitboard(occ)).rawValue
+        attackers = attackers or (rookLike and (state.wR.rawValue or state.wQ.rawValue or state.bR.rawValue or state.bQ.rawValue))
+        // Only consider pieces currently on the board (still in occ)
+        return attackers and occ
+    }
+
+    /**
+     * Returns the bitboard of the least-valuable attacker for `side`, and also returns its piece type via piece-type-ordered lookup.
+     * Returns 0uL if none.
+     */
+    private fun leastValuableAttacker(attackers: ULong, side: Boolean, state: ChessBitboardGameState): Pair<ULong, ChessPieceType> {
+        val p = if (side) state.wP.rawValue else state.bP.rawValue
+        var m = attackers and p; if (m != 0uL) return Pair(m and (0uL - m), ChessPieceType.PAWN)
+        val n = if (side) state.wN.rawValue else state.bN.rawValue
+        m = attackers and n; if (m != 0uL) return Pair(m and (0uL - m), ChessPieceType.KNIGHT)
+        val b = if (side) state.wB.rawValue else state.bB.rawValue
+        m = attackers and b; if (m != 0uL) return Pair(m and (0uL - m), ChessPieceType.BISHOP)
+        val r = if (side) state.wR.rawValue else state.bR.rawValue
+        m = attackers and r; if (m != 0uL) return Pair(m and (0uL - m), ChessPieceType.ROOK)
+        val q = if (side) state.wQ.rawValue else state.bQ.rawValue
+        m = attackers and q; if (m != 0uL) return Pair(m and (0uL - m), ChessPieceType.QUEEN)
+        val k = if (side) state.wK.rawValue else state.bK.rawValue
+        m = attackers and k; if (m != 0uL) return Pair(m and (0uL - m), ChessPieceType.KING)
+        return Pair(0uL, ChessPieceType.PAWN)
+    }
+
+    /**
+     * Static Exchange Evaluation. Returns the material swap score for a capture.
+     * Non-capture moves return 0.
+     * Test expectations:
+     *  - Qxp where pawn defended by pawn => -800   (gain 100, then lose 900)
+     *  - Qxn where knight defended by pawn => -580 (gain 320, then lose 900)
+     */
+    fun see(state: ChessBitboardGameState, move: BitboardChessMove): Int {
+        if (!move.isCapture) return 0
+        val to = move.to
+        val from = move.from
+
+        // Victim value
+        val victimType: ChessPieceType = if (move.flag == ChessMoveFlag.EP_CAPTURE) {
+            ChessPieceType.PAWN
+        } else {
+            getPieceType(to, !state.whiteToMove, state)
+        }
+        val attackerType = getPieceType(from, state.whiteToMove, state)
+
+        val gain = IntArray(32)
+        var d = 0
+        gain[0] = pieceValueForSEE(victimType)
+
+        // Promotions: treat as capturing with a queen (approximation) — add promotion gain
+        var currentAttackerVal = pieceValueForSEE(attackerType)
+        if (move.isPromotion) {
+            // Add queen - pawn as promotion gain; attacker becomes queen going forward
+            gain[0] += SEE_QUEEN - SEE_PAWN
+            currentAttackerVal = SEE_QUEEN
+        }
+
+        var occ = state.allOccupied.rawValue
+        occ = occ and (1uL shl from).inv()
+        if (move.flag == ChessMoveFlag.EP_CAPTURE) {
+            val epPawnSq = if (state.whiteToMove) to - 8 else to + 8
+            occ = occ and (1uL shl epPawnSq).inv()
+        }
+
+        var sideToMove = !state.whiteToMove
+        var attackers = attackersTo(to, state, occ)
+
+        while (true) {
+            // Current side's attackers
+            val sideMask = if (sideToMove)
+                (state.wP.rawValue or state.wN.rawValue or state.wB.rawValue or state.wR.rawValue or state.wQ.rawValue or state.wK.rawValue)
+            else
+                (state.bP.rawValue or state.bN.rawValue or state.bB.rawValue or state.bR.rawValue or state.bQ.rawValue or state.bK.rawValue)
+            val sideAttackers = attackers and sideMask
+            if (sideAttackers == 0uL) break
+            val (lvaBit, lvaType) = leastValuableAttacker(attackers, sideToMove, state)
+            if (lvaBit == 0uL) break
+
+            d++
+            gain[d] = currentAttackerVal - gain[d - 1]
+            // If we can't possibly improve, early cutoff
+            if (max(-gain[d - 1], gain[d]) < 0) break
+
+            currentAttackerVal = pieceValueForSEE(lvaType)
+
+            // Remove used attacker from occupancy and attackers
+            occ = occ and lvaBit.inv()
+            attackers = attackers and lvaBit.inv()
+            // Recompute x-rays along the diagonal/orthogonal through `to`
+            val bishopLike = moveGenerator.getBishopAttacks(to, ChessBitboard(occ)).rawValue and
+                    (state.wB.rawValue or state.wQ.rawValue or state.bB.rawValue or state.bQ.rawValue)
+            val rookLike = moveGenerator.getRookAttacks(to, ChessBitboard(occ)).rawValue and
+                    (state.wR.rawValue or state.wQ.rawValue or state.bR.rawValue or state.bQ.rawValue)
+            attackers = (attackers or bishopLike or rookLike) and occ
+
+            sideToMove = !sideToMove
+
+            if (d >= 31) break
+        }
+
+        // Negamax backward pass
+        while (d > 0) {
+            gain[d - 1] = -max(-gain[d - 1], gain[d])
+            d--
+        }
+        return gain[0]
     }
 
     fun inCheck(state: ChessBitboardGameState): Boolean {

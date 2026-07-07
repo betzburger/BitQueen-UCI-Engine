@@ -53,7 +53,7 @@ class BitQueenUCIEngine {
     fun start() {
         // Unbuffered output is preferred for UCI
         
-        println("BitQueen UCI v3.0 by Peter Betz")
+        println("BitQueen UCI v4.0 by Peter Betz")
         
         var running = true
         while (running) {
@@ -85,7 +85,7 @@ class BitQueenUCIEngine {
     }
     
     private fun handleUCI() {
-        println("id name BitQueen 3.0")
+        println("id name BitQueen 4.0")
         println("id author Peter Betz")
         println()
         
