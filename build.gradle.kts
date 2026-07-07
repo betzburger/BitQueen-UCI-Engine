@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "de.peterbetz.bitqueen"
-version = "3.0"
+version = "4.2"
 
 repositories {
     mavenCentral()
@@ -11,8 +11,17 @@ repositories {
 
 kotlin {
     jvm()
-    macosArm64 {
-        binaries {
+    
+    val nativeTargets = listOf(
+        macosArm64(),
+        macosX64(),
+        mingwX64(),
+        linuxX64(),
+        linuxArm64()
+    )
+    
+    nativeTargets.forEach { target ->
+        target.binaries {
             executable {
                 baseName = "BitQueen-UCI"
                 entryPoint = "de.peterbetz.bitqueen.uci.main"
@@ -27,7 +36,6 @@ kotlin {
             }
         }
         val jvmMain by getting
-        val macosArm64Main by getting
     }
 }
 
