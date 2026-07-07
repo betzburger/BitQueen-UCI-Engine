@@ -2,6 +2,8 @@
 
 A professional, UCI-compatible chess engine written in Kotlin by Peter Betz.
 
+BitQueen Engine originally came from my Checkers project and was later converted to a Chess engine.
+
 ## Features
 
 ### Core Engine
